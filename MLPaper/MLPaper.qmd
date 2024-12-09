@@ -1,0 +1,984 @@
+---
+title: "MLPaper"
+format: pdf
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+## 
+
+加载包 注：或许可以对以下包添加引用和感谢
+
+```{r}
+#以下if语句最终版删掉
+if (!require(dplyr)) install.packages("dplyr")
+if (!require("xgboost")) install.packages("xgboost")
+if (!require("caret")) install.packages("caret")
+if (!require("data.table")) install.packages("data.table")
+if (!require("Matrix")) install.packages("Matrix")
+if (!require("rsample")) install.packages("rsample")
+if (!require("randomForest")) install.packages("randomForest")
+if (!require("ggplot2")) install.packages("ggplot2")
+
+# 载入必要包
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(xgboost)
+library(caret)
+library(data.table)
+library(Matrix)
+library(MASS)
+library(rsample)
+library(tidyverse)
+library(caret)
+library(pROC)
+library(corrplot)
+library(rpart)      
+library(rpart.plot)  
+
+
+```
+
+读取数据
+
+```{r}
+raw_data <- read.csv("train.csv")
+raw_test <- read.csv("test.csv")
+```
+
+数据展示
+
+```{r}
+# 显示数据的结构
+str(raw_data)
+
+# 显示全部数据
+print(raw_data)
+```
+
+数据清理
+
+```{r}
+# 删除PatientID和DoctorInCharge
+
+raw_data$PatientID <- NULL
+raw_data$DoctorInCharge <- NULL
+raw_test$DoctorInCharge <- NULL
+```
+
+将种族和edu拆分
+
+```{r}
+# 使用 model.matrix 创建指示变量并保留其他所有变量
+raw2_data <- model.matrix(~ . + factor(Ethnicity) + factor(EducationLevel) - Ethnicity - EducationLevel - 1, 
+                          data = raw_data)
+
+# 转换后的数据集的列名调整，以便更加清晰地表示每个变量
+colnames(raw2_data) <- gsub("factor\\(Ethnicity\\)", "Ethnicity", colnames(raw2_data))
+colnames(raw2_data) <- gsub("factor\\(EducationLevel\\)", "EducationLevel", colnames(raw2_data))
+
+# 将生成的矩阵转换为数据框以确保兼容性
+raw2_data <- as.data.frame(raw2_data)
+
+# 输出数据集
+write.csv(raw2_data, "raw2_data.csv", row.names = FALSE)
+
+# 确认数据中的列名
+print(colnames(raw2_data))
+
+```
+
+处理test数据集 注：此数据集并非有答案的test数据集
+以下的模型均由tarin数据集分割后经行训练和检查
+test数据集是没有答案的纯检验数据集 通过在kaggle上交答案来得到正确率
+
+```{r}
+# 使用 model.matrix 创建指示变量并保留其他所有变量
+raw2_test <- model.matrix(~ . + factor(Ethnicity) + factor(EducationLevel) - Ethnicity - EducationLevel - 1, 
+                          data = raw_test)
+
+# 转换后的数据集的列名调整，以便更加清晰地表示每个变量
+colnames(raw2_test) <- gsub("factor\\(Ethnicity\\)", "Ethnicity", colnames(raw2_test))
+colnames(raw2_test) <- gsub("factor\\(EducationLevel\\)", "EducationLevel", colnames(raw2_test))
+
+# 将生成的矩阵转换为数据框以确保兼容性
+raw2_test <- as.data.frame(raw2_test)
+
+# 输出数据集
+write.csv(raw2_test, "raw2_test.csv", row.names = FALSE)
+# 确认数据中的列名
+print(colnames(raw2_test))
+
+
+```
+
+Data transformation 之前的拆分edu和种族已经属于一种transf （One-Hot
+Encoding）
+一下是将有较宽的数值范围，或者是连续变量，且在分析和建模中可能会因为尺度问题引入偏差，因此适合标
+standerlization
+
+```{r}
+# 加载数据
+data <- read.csv("raw2_data.csv")
+
+# 需要标准化的变量列表
+vars_to_standardize <- c("BMI", "AlcoholConsumption", "PhysicalActivity", 
+                         "DietQuality", "SleepQuality", 
+                         "SystolicBP", "DiastolicBP", 
+                         "CholesterolTotal", "CholesterolLDL", 
+                         "CholesterolHDL", "CholesterolTriglycerides", 
+                         "MMSE", "FunctionalAssessment", "ADL")
+
+# 标准化变量
+for (var in vars_to_standardize) {
+  data[[var]] <- scale(data[[var]], center = TRUE, scale = TRUE)
+}
+
+# 查看标准化后的数据
+head(data)
+
+# 保存标准化后的数据
+write.csv(data, "raw3_data.csv", row.names = FALSE)
+```
+
+对于test做相同操作
+
+```{r}
+# 加载数据
+data <- read.csv("raw2_test.csv")
+
+# 需要标准化的变量列表
+vars_to_standardize <- c("BMI", "AlcoholConsumption", "PhysicalActivity", 
+                         "DietQuality", "SleepQuality", 
+                         "SystolicBP", "DiastolicBP", 
+                         "CholesterolTotal", "CholesterolLDL", 
+                         "CholesterolHDL", "CholesterolTriglycerides", 
+                         "MMSE", "FunctionalAssessment", "ADL")
+
+# 标准化变量
+for (var in vars_to_standardize) {
+  data[[var]] <- scale(data[[var]], center = TRUE, scale = TRUE)
+}
+
+# 查看标准化后的数据
+head(data)
+
+# 保存标准化后的数据
+write.csv(data, "raw3_test.csv", row.names = FALSE)
+```
+
+特征清理
+
+```{r}
+# 加载数据
+data <- read.csv("raw3_data.csv")
+
+# 确认目标变量为 'Diagnosis' 并转换为因子类型
+data$Diagnosis <- as.factor(data$Diagnosis)
+
+# -------------------------------
+# 特征重要性分析
+# -------------------------------
+# 构建随机森林模型评估特征重要性
+set.seed(123)  # 确保结果可重复
+rf_model <- randomForest(Diagnosis ~ ., data = data, importance = TRUE)
+
+# 提取特征重要性
+rf_importance <- rf_model$importance
+
+# 转换重要性数据为数据框
+importance_df <- data.frame(
+  Feature = rownames(rf_importance),
+  Importance = rf_importance[, "MeanDecreaseGini"]
+)
+
+# 按重要性排序并计算累积贡献
+importance_df <- importance_df[order(-importance_df$Importance), ]
+importance_df$Cumulative <- cumsum(importance_df$Importance) / sum(importance_df$Importance)
+
+# -------------------------------
+# 可视化特征重要性
+# -------------------------------
+# 绘制特征重要性条形图（带虚线）
+threshold <- median(importance_df$Importance)  # 中位数为阈值
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_hline(yintercept = threshold, linetype = "dashed", color = "red", size = 1) +
+  labs(title = "特征重要性条形图",
+       x = "特征",
+       y = "重要性（Mean Decrease Gini）") +
+  annotate("text", x = 1, y = threshold + 0.01, 
+           label = paste("阈值 =", round(threshold, 2)),
+           hjust = 0, color = "red", size = 4) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 绘制累积贡献图
+ggplot(importance_df, aes(x = reorder(Feature, -Importance), y = Cumulative)) +
+  geom_line(group = 1) +
+  geom_point() +
+  geom_hline(yintercept = 0.98, linetype = "dashed", color = "red") +
+  labs(title = "特征重要性累积贡献图",
+       x = "特征（按重要性排序）",
+       y = "累积贡献比例") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# -------------------------------
+# 特征选择
+# -------------------------------
+# 根据累积贡献选择需要保留的变量
+selected_features <- importance_df$Feature[importance_df$Cumulative <= 0.98]
+removed_features <- setdiff(importance_df$Feature, selected_features)
+
+# 输出保留和剔除的变量
+cat("应该保留的变量:\n")
+print(selected_features)
+
+cat("\n应该剔除的变量:\n")
+print(removed_features)
+
+# 创建仅包含保留变量的数据集
+data_selected <- data[, c(selected_features, "Diagnosis")]
+
+# -------------------------------
+# 模型交叉验证
+# -------------------------------
+# 创建交叉验证控制器
+set.seed(123)
+cv_control <- trainControl(method = "cv", number = 10, verboseIter = FALSE)
+
+# 使用交叉验证训练随机森林模型
+cv_model <- train(Diagnosis ~ ., data = data_selected, method = "rf", trControl = cv_control)
+
+# -------------------------------
+# 模型性能分析
+# -------------------------------
+# 提取交叉验证结果
+cv_results <- cv_model$results
+
+# 绘制交叉验证结果
+ggplot(cv_results, aes(x = mtry, y = Accuracy)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "交叉验证准确率随 mtry 变化图",
+       x = "mtry 值",
+       y = "交叉验证准确率") +
+  theme_minimal()
+
+# 输出最佳模型的 mtry 值及对应的准确率
+cat("\n最佳 mtry 值:", cv_model$bestTune$mtry, "\n")
+cat("对应的交叉验证准确率:", max(cv_results$Accuracy), "\n")
+
+
+```
+
+删除无关变量 注：解释刚刚的图标说明为什么需要删除这些变量
+另外如果你们愿意可以去查查资料说明有那些变量虽然通过数据可以删除但是在医学角度或者其他角度需要保留
+然后直接在下面的代码中去掉即可 不会影响后续的代码
+
+```{r}
+
+# 读取数据集
+tdata <- read.csv("raw3_data.csv")
+
+# 确定需要剔除的变量
+remove_vars <- c("Disorientation", "Confusion", "PersonalityChanges", 
+                 "DifficultyCompletingTasks", "Ethnicity2", "EducationLevel3", 
+                 "HeadInjury", "Ethnicity3")
+
+# 将变量名从括号形式转换为点号形式（如必要）
+remove_vars <- gsub("\\(|\\)", ".", remove_vars)
+
+# 剔除变量
+for (var in remove_vars) {
+  if (var %in% colnames(tdata)) {
+    tdata[[var]] <- NULL  # 剔除变量
+  } else {
+    cat("未找到变量：", var, "\n")
+  }
+}
+
+# 确认剔除后的变量
+cat("剔除后的数据集包含以下变量:\n")
+print(colnames(tdata))
+
+# 保存剔除后的数据集
+write.csv(tdata, "tdata.csv", row.names = FALSE)
+
+
+```
+
+选择合适模型
+
+// Dennis的模型 使用的是raw2_data 没有经过上述相关性和随机森林的特征提取
+而是dennis的手动提取 注意区分
+
+```{r}
+# 设置随机种子，确保结果可复现
+set.seed(123)
+
+# 将数据转换为数据框
+data <- as.data.frame(raw2_data)
+
+# 使用 initial_split 将数据集划分为训练集和测试集
+data_split <- initial_split(data, prop = 0.8)
+
+# 创建训练集和测试集
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# 检查训练集和测试集的大小
+cat("训练集大小:", nrow(train_data), "\n")
+cat("测试集大小:", nrow(test_data), "\n")
+
+```
+
+```{r Linear model}
+# Docter in charge is not correlated
+summary(train_data)
+
+# Fit the linear regression model
+lin_fit <- lm(Diagnosis ~ ., data = train_data)
+
+# Summarize the model
+summary(lin_fit)
+
+```
+
+```{r AIC BIC}
+# Stepwise model selection using BIC
+n <- nrow(train_data)  # Number of observations in the dataset
+step_bic <- step(lin_fit, direction = "both", k = log(n), trace = FALSE)
+
+# Summary of the final model
+summary(step_bic)
+
+# Stepwise model selection using AIC
+step_aic <- step(lin_fit, direction = "both", trace = FALSE)
+
+# Summary of the final model
+summary(step_aic)
+```
+
+```{r test accurancy}
+# Use the optimized BIC model to predict on the test data
+bic_predictions <- predict(step_bic, newdata = test_data)
+
+# Use the optimized AIC model to predict on the test data
+aic_predictions <- predict(step_aic, newdata = test_data)
+
+# Convert BIC and AIC predictions to binary classification
+bic_predictions_binary <- ifelse(bic_predictions > 0.5, 1, 0)
+aic_predictions_binary <- ifelse(aic_predictions > 0.5, 1, 0)
+
+# Actual Diagnosis values from the test data
+actual <- test_data$Diagnosis
+
+# Compute accuracy for BIC model
+bic_accuracy <- mean(bic_predictions_binary == actual)
+cat("Accuracy of BIC Model:", bic_accuracy, "\n")
+
+# Compute accuracy for AIC model
+aic_accuracy <- mean(aic_predictions_binary == actual)
+cat("Accuracy of AIC Model:", aic_accuracy, "\n")
+
+# Compute RMSE for BIC model (for regression tasks)
+bic_rmse <- sqrt(mean((bic_predictions - actual)^2))
+cat("RMSE of BIC Model:", bic_rmse, "\n")
+
+# Compute RMSE for AIC model (for regression tasks)
+aic_rmse <- sqrt(mean((aic_predictions - actual)^2))
+cat("RMSE of AIC Model:", aic_rmse, "\n")
+
+```
+
+```{r}
+# Define the full model with all predictors
+full_model <- glm(Diagnosis ~ Age + Gender + BMI + Smoking + AlcoholConsumption + PhysicalActivity + 
+                  DietQuality + SleepQuality + FamilyHistoryAlzheimers + CardiovascularDisease + 
+                  Diabetes + Depression + HeadInjury + Hypertension + SystolicBP + DiastolicBP + 
+                  CholesterolTotal + CholesterolLDL + CholesterolHDL + CholesterolTriglycerides + 
+                  MMSE + FunctionalAssessment + MemoryComplaints + BehavioralProblems + ADL + 
+                  Confusion + Disorientation + PersonalityChanges + DifficultyCompletingTasks + 
+                  Forgetfulness + `factor(Ethnicity)0` + `factor(Ethnicity)1` + `factor(Ethnicity)2` + 
+                  `factor(Ethnicity)3` + `factor(EducationLevel)1` + `factor(EducationLevel)2` + 
+                  `factor(EducationLevel)3`, data = train_data, family = binomial(link = "logit"))
+# Print the final selected model
+cat("Final Selected Model:\n")
+print(full_model)
+
+# Use the selected model to predict on the test data
+predicted_probabilities <- predict(full_model, newdata = test_data, type = "response")
+
+# Convert probabilities into binary predictions using a threshold of 0.5
+predicted_classes <- ifelse(predicted_probabilities > 0.5, 1, 0)
+
+# Add predictions to the test data for evaluation
+test_data <- test_data %>%
+  mutate(Predicted = predicted_classes)
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(factor(test_data$Predicted), factor(test_data$Diagnosis))
+
+# Extract accuracy as a percentage
+accuracy <- conf_matrix$overall["Accuracy"] * 100
+
+# Calculate ROC and AUC
+roc_curve <- roc(test_data$Diagnosis, predicted_probabilities)
+auc_value <- auc(roc_curve)
+
+# Print accuracy percentage and AUC for reference
+cat("Accuracy (%):", accuracy, "\n")
+cat("AUC:", auc_value, "\n")
+
+# Export accuracy and AUC as a summary file
+summary_metrics <- data.frame(
+  Metric = c("Accuracy (%)", "AUC"),
+  Value = c(accuracy, auc_value)
+)
+
+```
+
+```{r modifying GLM}
+# Extract binary variables using base R
+binary_variables <- names(train_data)[sapply(train_data, function(col) all(unique(col) %in% c(0, 1)))]
+
+# Exclude "Diagnosis" from the binary variables if it's included
+binary_variables <- setdiff(binary_variables, "Diagnosis")
+
+# Wrap binary variable names with backticks to avoid issues with special characters or numbers
+binary_variables <- paste0("`", binary_variables, "`")
+
+formula <- as.formula(paste("Diagnosis ~", paste(binary_variables, collapse = " + ")))
+
+# Fit the GLM with the binary variables
+binary_glm <- glm(formula, data = train_data, family = binomial(link = "logit"))
+
+# Summarize the GLM
+summary(binary_glm)
+
+# Predict on test data
+predicted_probabilities <- predict(binary_glm, newdata = test_data, type = "response")
+
+# Convert probabilities into binary predictions using a threshold of 0.5
+predicted_classes <- ifelse(predicted_probabilities > 0.5, 1, 0)
+
+# Evaluate the model
+conf_matrix <- confusionMatrix(factor(predicted_classes), factor(test_data$Diagnosis))
+
+# Extract accuracy and AUC
+accuracy <- conf_matrix$overall["Accuracy"] * 100
+roc_curve <- roc(test_data$Diagnosis, predicted_probabilities)
+auc_value <- auc(roc_curve)
+
+# Print accuracy and AUC
+cat("Accuracy (%):", accuracy, "\n")
+cat("AUC:", auc_value, "\n")
+```
+
+```{r Poisson GLM}
+poisson_formula <- as.formula(paste("Diagnosis ~", paste(binary_variables, collapse = " + ")))
+
+# Fit the Poisson GLM with the binary variables
+poisson_glm <- glm(poisson_formula, data = train_data, family = poisson(link = "log"))
+
+# Summarize the Poisson GLM
+summary(poisson_glm)
+
+# Predict on test data
+predicted_counts <- predict(poisson_glm, newdata = test_data, type = "response")
+
+# If Diagnosis is binary, convert the predictions into binary values
+predicted_classes <- ifelse(predicted_counts > 0.5, 1, 0)
+
+# Evaluate the model
+conf_matrix <- confusionMatrix(factor(predicted_classes), factor(test_data$Diagnosis))
+
+# Extract accuracy
+accuracy <- conf_matrix$overall["Accuracy"] * 100
+
+# Print accuracy
+cat("Accuracy (%):", accuracy, "\n")
+```
+
+```{r Attempt to Use Combination of Possion and Linear}
+# 1. Define binary and continuous variables
+binary_vars <- c("ADL", "BehavioralProblems", "Confusion", "Depression", "DifficultyCompletingTasks", 
+                 "Disorientation", "FamilyHistoryAlzheimers", "Forgetfulness", "Gender", 
+                 "HeadInjury", "Hypertension", "MemoryComplaints", "PersonalityChanges", "Smoking")
+continuous_vars <- c("Age", "AlcoholConsumption", "BMI", "CardiovascularDisease", "CholesterolHDL", 
+                     "CholesterolLDL", "DietQuality", "FunctionalAssessment", "MMSE", "PhysicalActivity", "SleepQuality")
+
+# Ensure that 'Diagnosis' is included in the training data and remove any missing values
+train_data <- na.omit(train_data)
+train_data$Diagnosis <- as.numeric(as.character(train_data$Diagnosis))  # Convert Diagnosis to numeric
+
+# 2. Fit Poisson regression model on binary variables
+# Select only the binary variables and 'Diagnosis'
+train_binary <- train_data[, c(binary_vars, "Diagnosis")]
+
+# Ensure that 'Diagnosis' contains non-negative values for Poisson regression
+train_binary <- train_binary[train_binary$Diagnosis >= 0, ]
+
+# Fit Poisson model (assuming Diagnosis is the outcome variable)
+poisson_model <- glm(Diagnosis ~ ., data = train_binary, family = poisson)
+
+# 3. Fit Linear regression model on continuous variables
+# Select only the continuous variables and 'Diagnosis'
+train_continuous <- train_data[, c(continuous_vars, "Diagnosis")]
+
+# Fit Linear model
+linear_model <- lm(Diagnosis ~ ., data = train_continuous)
+
+# 4. Generate predictions
+# For Poisson model
+poisson_preds <- predict(poisson_model, newdata = test_data[, c(binary_vars)], type = "response")
+
+# For Linear model
+linear_preds <- predict(linear_model, newdata = test_data[, c(continuous_vars)])
+
+# 5. Combine predictions (average for simplicity)
+final_preds <- (poisson_preds + linear_preds) / 2
+
+# 6. Convert predictions to binary classification (threshold of 0.5)
+predicted_classes <- ifelse(final_preds > 0.5, 1, 0)
+
+# 7. Evaluate the model
+# Compute accuracy (percentage of correct predictions)
+accuracy <- mean(predicted_classes == as.numeric(as.character(test_data$Diagnosis))) * 100
+
+# Print accuracy
+cat("Accuracy (%):", accuracy, "\n")
+```
+
+// 以下模型使用的是自动清理过后的tdata 决策树
+
+```{r}
+
+# 加载数据
+data <- read.csv("tdata.csv")
+
+# 确保目标变量 'Diagnosis' 为因子类型
+data$Diagnosis <- as.factor(data$Diagnosis)
+
+# 划分数据集为训练集和测试集
+set.seed(123)  # 固定随机种子
+train_index <- createDataPartition(data$Diagnosis, p = 0.8, list = FALSE)
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+
+# 构建决策树模型
+tree_model <- rpart(Diagnosis ~ ., data = train_data, method = "class")
+
+# 保存模型为RDS文件
+saveRDS(tree_model, file = "decision_tree_model.rds")
+cat("模型已保存为 'decision_tree_model.rds'\n")
+
+# 可视化决策树
+rpart.plot(tree_model, main = "决策树图示", type = 3, extra = 102, under = TRUE, fallen.leaves = TRUE)
+
+# 在测试集上预测
+predictions <- predict(tree_model, newdata = test_data, type = "class")
+
+# 评估模型性能
+conf_matrix <- confusionMatrix(predictions, test_data$Diagnosis)
+
+# 输出混淆矩阵和准确率
+print(conf_matrix)
+
+# 输出模型的准确率
+cat("模型的预测准确率为：", conf_matrix$overall['Accuracy'], "\n")
+
+
+```
+
+使用网格搜索 (Grid Search) 优化参数 注：可以介绍网格搜索优化的原理
+另外刚刚的决策树需要阐明已经足够精简所以不需要prune
+主要是我prune之后模型没有变化
+
+```{r}
+# 加载必要包
+library(rpart)
+library(caret)
+
+# 加载数据
+data <- read.csv("tdata.csv")
+
+# 确保目标变量为因子类型
+data$Diagnosis <- as.factor(data$Diagnosis)
+
+# 划分数据集为训练集和测试集
+set.seed(123)
+trainIndex <- createDataPartition(data$Diagnosis, p = 0.8, list = FALSE)
+train_data <- data[trainIndex, ]
+test_data <- data[-trainIndex, ]
+
+# 定义网格搜索范围
+grid <- expand.grid(
+  cp = seq(0.001, 0.1, by = 0.005)  # 复杂度参数范围
+)
+
+# 定义控制参数
+control <- trainControl(
+  method = "cv",                      # 交叉验证
+  number = 5,                         # 5折交叉验证
+  verboseIter = FALSE
+)
+
+# 使用caret的train函数进行网格搜索
+set.seed(123)
+grid_search <- train(
+  Diagnosis ~ ., 
+  data = train_data, 
+  method = "rpart", 
+  trControl = control, 
+  tuneGrid = grid
+)
+
+# 输出优化后的参数
+cat("优化后的参数:\n")
+print(grid_search$bestTune)
+
+
+```
+
+优化后的决策树
+
+```{r}
+
+# 使用优化后的 cp 参数重新训练决策树
+set.seed(123)
+final_tree <- rpart(
+  Diagnosis ~ ., 
+  data = train_data, 
+  method = "class", 
+  control = rpart.control(cp = 0.001)
+)
+# 保存模型到本地文件
+save(final_model, file = "optimized_decision_tree_model.RData")
+
+
+# 输出最终的决策树信息
+print(final_tree)
+
+# 绘制最终的决策树
+rpart.plot(
+  final_tree, 
+  type = 2, 
+  extra = 104, 
+  fallen.leaves = TRUE,
+  main = "使用优化参数训练的决策树"
+)
+
+# 预测测试集
+test_predictions <- predict(final_tree, newdata = test_data, type = "class")
+
+# 生成混淆矩阵
+conf_matrix <- table(Predicted = test_predictions, Actual = test_data$Diagnosis)
+cat("混淆矩阵:\n")
+print(conf_matrix)
+
+# 计算测试集准确率
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("测试集准确率:", round(accuracy * 100, 2), "%\n")
+
+```
+
+输出test预测
+
+```{r}
+
+# 读取训练好的决策树模型
+load("optimized_decision_tree_model.RData")  # 替换为保存模型的路径
+
+# 读取测试数据集
+test_data <- read.csv("raw2_test.csv")
+
+# 对测试数据进行预测
+predictions <- predict(final_tree, newdata = test_data, type = "class")
+
+# 创建提交文件，格式仿照示例
+submission <- data.frame(
+  PatientID = test_data$PatientID,  # 假设测试集中有 'PatientID' 列
+  Diagnosis = predictions
+)
+
+# 保存结果为 CSV 文件
+write.csv(submission, file = "Decision_Tree_Predictions.csv", row.names = FALSE)
+
+cat("预测结果已保存为文件 'Decision_Tree_Predictions.csv'\n")
+
+```
+
+XGboost
+
+```{r}
+# 读取数据
+data <- read.csv("tdata.csv")
+
+# 数据预处理
+data$Diagnosis <- as.factor(data$Diagnosis)  # 确保 Diagnosis 是分类变量
+y <- data$Diagnosis
+X <- data[, setdiff(names(data), "Diagnosis")]  # 特征
+
+# 将数据分为训练集和测试集
+set.seed(123)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+train_data <- X[train_index, ]
+train_label <- y[train_index]
+test_data <- X[-train_index, ]
+test_label <- y[-train_index]
+
+# 转换为 XGBoost 格式
+dtrain <- xgb.DMatrix(data = as.matrix(train_data), label = as.numeric(train_label) - 1)
+dtest <- xgb.DMatrix(data = as.matrix(test_data), label = as.numeric(test_label) - 1)
+
+# 模型训练
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  booster = "gbtree",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+set.seed(123)
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10
+)
+
+# 预测与评估
+predictions <- predict(xgb_model, dtest)
+predictions <- ifelse(predictions > 0.5, 1, 0)
+
+# 准确率
+accuracy <- mean(predictions == as.numeric(test_label) - 1)
+
+# 混淆矩阵
+confusion_matrix <- table(Predicted = predictions, Actual = as.numeric(test_label) - 1)
+
+# Precision, Recall 和 F1-Score
+TP <- confusion_matrix[2, 2]
+FP <- confusion_matrix[2, 1]
+FN <- confusion_matrix[1, 2]
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# 输出结果
+print(paste("测试集准确率:", round(accuracy * 100, 2), "%"))
+print("混淆矩阵:")
+print(confusion_matrix)
+print(paste("Precision:", round(precision, 2)))
+print(paste("Recall:", round(recall, 2)))
+print(paste("F1-Score:", round(f1, 2)))
+```
+
+使用网格搜索 (Grid Search) 优化参数 注：这个要跑很久大概3-5min
+如果你的电脑更好就当我没说 毕竟这个时间是我的r5跑的
+
+```{r}
+# 读取数据
+data <- read.csv("tdata.csv")
+data$Diagnosis <- as.factor(data$Diagnosis)
+y <- data$Diagnosis
+X <- data[, setdiff(names(data), "Diagnosis")]
+
+# 分割数据集（分层抽样）
+set.seed(123)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+train_data <- X[train_index, ]
+train_label <- as.numeric(y[train_index]) - 1  # 转换为 0/1
+test_data <- X[-train_index, ]
+test_label <- as.numeric(y[-train_index]) - 1
+
+# 转换为 DMatrix 格式
+dtrain <- xgb.DMatrix(data = as.matrix(train_data), label = train_label)
+dtest <- xgb.DMatrix(data = as.matrix(test_data), label = test_label)
+
+# 定义参数网格为列表
+param_grid <- expand.grid(
+  max_depth = c(3, 6, 9),
+  eta = c(0.01, 0.1, 0.3),
+  subsample = c(0.6, 0.8, 1),
+  colsample_bytree = c(0.6, 0.8, 1),
+  min_child_weight = c(1, 5, 10),
+  gamma = c(0, 1, 5)
+)
+
+# 转换参数网格为列表格式
+param_list <- split(param_grid, seq(nrow(param_grid)))
+
+# 自定义评估函数
+custom_eval <- function(params) {
+  set.seed(123)  # 保持随机性一致
+  model <- xgb.train(
+    params = list(
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      max_depth = params$max_depth,
+      eta = params$eta,
+      subsample = params$subsample,
+      colsample_bytree = params$colsample_bytree,
+      min_child_weight = params$min_child_weight,
+      gamma = params$gamma,
+      tree_method = "hist"  # 使用直方图算法
+    ),
+    data = dtrain,
+    nrounds = 100,
+    watchlist = list(test = dtest),
+    early_stopping_rounds = 10,
+    verbose = 0
+  )
+  # 返回验证集 Logloss
+  return(model$best_score)
+}
+
+# 对每组参数进行评估
+results <- sapply(param_list, custom_eval)
+
+# 获取最优参数
+best_index <- which.min(results)
+best_params <- param_list[[best_index]]
+
+# 输出最优参数和对应的评估结果
+print(best_params)
+print(paste("最佳 Logloss:", round(min(results), 4)))
+
+
+
+```
+
+xgboost优化后
+
+```{r}
+# 读取数据
+data <- read.csv("tdata.csv")
+
+# 数据预处理
+data$Diagnosis <- as.factor(data$Diagnosis)  # 确保 Diagnosis 是分类变量
+y <- data$Diagnosis
+X <- data[, setdiff(names(data), "Diagnosis")]  # 特征
+
+# 将数据分为训练集和测试集
+set.seed(123)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+train_data <- X[train_index, ]
+train_label <- as.numeric(y[train_index]) - 1  # 转换为 0/1
+test_data <- X[-train_index, ]
+test_label <- as.numeric(y[-train_index]) - 1
+
+# 转换为 XGBoost 格式
+dtrain <- xgb.DMatrix(data = as.matrix(train_data), label = train_label)
+dtest <- xgb.DMatrix(data = as.matrix(test_data), label = test_label)
+
+# 最佳参数（基于优化结果）
+best_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  tree_method = "hist",
+  max_depth = 6,  # 更新为最佳 max_depth
+  eta = 0.3,      # 更新为最佳 eta
+  subsample = 1,  # 更新为最佳 subsample
+  colsample_bytree = 1,  # 更新为最佳 colsample_bytree
+  min_child_weight = 1,  # 更新为最佳 min_child_weight
+  gamma = 1       # 更新为最佳 gamma
+)
+
+# 模型训练
+set.seed(123)
+xgb_model <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+# 保存模型
+xgb.save(xgb_model, "best_xgb_model.model")
+
+# 预测与评估
+predictions <- predict(xgb_model, dtest)
+predictions <- ifelse(predictions > 0.5, 1, 0)
+
+# 准确率
+accuracy <- mean(predictions == test_label)
+
+# 混淆矩阵
+confusion_matrix <- table(Predicted = predictions, Actual = test_label)
+
+# Precision, Recall 和 F1-Score
+TP <- confusion_matrix[2, 2]
+FP <- confusion_matrix[2, 1]
+FN <- confusion_matrix[1, 2]
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# 输出结果
+cat("测试集准确率:", round(accuracy * 100, 2), "%\n")
+cat("混淆矩阵:\n")
+print(confusion_matrix)
+cat("Precision:", round(precision, 2), "\n")
+cat("Recall:", round(recall, 2), "\n")
+cat("F1-Score:", round(f1, 2), "\n")
+
+```
+
+输出test 注：此为最高正确率模型
+
+```{r}
+# 加载必要包
+library(xgboost)
+library(data.table)
+
+# 加载训练和测试数据
+train_data <- fread("tdata.csv")
+test_data <- fread("raw3_test.csv")
+
+# 提取 PatientID
+patient_ids <- test_data$PatientID
+test_data <- test_data[, !("PatientID"), with = FALSE]
+
+# 获取训练数据的特征名称
+train_features <- colnames(train_data[, !("Diagnosis"), with = FALSE])
+
+# 确保测试数据中仅包含训练数据的特征
+test_features <- test_data[, ..train_features]
+
+# 转换为 XGBoost 格式
+dtest <- xgb.DMatrix(data = as.matrix(test_features))
+
+# 加载模型
+best_xgb_model <- xgb.load("best_xgb_model.model")
+
+# 预测
+predictions <- predict(best_xgb_model, dtest)
+
+# 转换预测结果
+diagnosis <- ifelse(predictions >= 0.5, 1, 0)
+
+# 创建结果数据集
+result <- data.table(PatientID = patient_ids, Diagnosis = diagnosis)
+
+# 保存结果到 CSV 文件
+fwrite(result, "prediction_results12.5.2.csv")
+
+cat("预测结果已保存到 'prediction_results.csv'。\n")
+
+
+
+```
+
+\`\`\`
