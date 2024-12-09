@@ -1,0 +1,732 @@
+---
+title: "314ProjXGboostSP"
+format:
+  pdf:
+    documentclass: article
+execute:
+  echo: true        # 显示代码
+  warning: false    # 隐藏警告
+  message: false    # 隐藏消息
+  error: false      # 隐藏错误
+  fig-show: false   # 隐藏图形
+  results: hide     # 隐藏结果
+---
+
+```{r}
+
+#以下if语句最终版删掉
+if (!require(dplyr)) install.packages("dplyr")
+if (!require("xgboost")) install.packages("xgboost")
+if (!require("caret")) install.packages("caret")
+if (!require("data.table")) install.packages("data.table")
+if (!require("Matrix")) install.packages("Matrix")
+if (!require("rsample")) install.packages("rsample")
+if (!require("randomForest")) install.packages("randomForest")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("ggplot2")) install.packages("e1071")
+
+# 加载包
+library(e1071)
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(xgboost)
+library(caret)
+library(data.table)
+library(Matrix)
+library(MASS)
+library(rsample)
+library(tidyverse)
+library(caret)
+library(pROC)
+library(corrplot)
+library(rpart)      
+library(rpart.plot)  
+library(glmnet)
+library(ROSE)
+
+
+
+```
+
+读取数据与展示
+
+```{r}
+raw_data <- read.csv("train.csv")
+raw_test <- read.csv("test.csv")
+write.csv(raw_data, "raw_train.csv", row.names = FALSE)
+write.csv(raw_test, "raw_test.csv", row.names = FALSE)
+# 显示数据的结构
+str(raw_data)
+# 显示全部数据
+print(raw_data)
+
+```
+
+展开edu于eth还有去除docID
+
+```{r}
+clean_and_save <- function(input_file, output_file) 
+{
+  # 读取数据
+  raw_data <- read.csv(input_file, stringsAsFactors = FALSE)
+  
+  # 去除docID
+  raw_data$DoctorInCharge <- NULL
+  
+  # 展开edu以及eth
+  # 使用 model.matrix 创建指示变量并保留其他变量
+  raw2_data <- model.matrix(~ . + factor(Ethnicity) + factor(EducationLevel) - Ethnicity - EducationLevel - 1, 
+                            data = raw_data)
+  
+  # 调整列名以便清晰表示每个变量
+  colnames(raw2_data) <- gsub("factor\\(Ethnicity\\)", "Ethnicity", colnames(raw2_data))
+  colnames(raw2_data) <- gsub("factor\\(EducationLevel\\)", "EducationLevel", colnames(raw2_data))
+  
+  # 将生成的矩阵转换为数据框
+  raw2_data <- as.data.frame(raw2_data)
+  
+  
+  
+  # 保存清理后的数据到 CSV 文件
+  write.csv(raw2_data, output_file, row.names = FALSE)
+  
+  # 返回清理后的数据框以便后续使用
+  return(raw2_data)
+}
+```
+
+应用以上
+
+```{r}
+# 清理并保存 test.csv 文件
+cleaned_test <- clean_and_save("raw_test.csv", "raw2_test.csv")
+
+# 清理并保存 train.csv 文件
+cleaned_train <- clean_and_save("raw_train.csv", "raw2_train.csv")
+```
+
+计算所有连续变量的偏度准备经行standardization, Log tansf, box cox
+
+```{r}
+
+# 读取数据
+data <- read.csv("raw2_train.csv", stringsAsFactors = FALSE)
+
+# 指定需要分析的变量
+variables <- c("Age", "BMI", "PhysicalActivity", "AlcoholConsumption", "DietQuality","SleepQuality", "SystolicBP", "DiastolicBP", "CholesterolTotal", "CholesterolLDL", "CholesterolHDL", "CholesterolTriglycerides", "MMSE","FunctionalAssessment", "ADL")
+
+# 初始化结果数据框
+skewness_table <- data.frame(
+  Variable = character(),
+  Skewness = numeric(),
+  Suggested_Transformation = character(),
+  stringsAsFactors = FALSE
+)
+
+# 计算偏度并给出建议变换
+for (var in variables) {
+  if (var %in% names(data)) {
+    var_data <- na.omit(data[[var]])
+    skew_val <- skewness(var_data)
+    
+    if (skew_val > 1) {
+      suggestion <- "Log Transformation"
+    } else if (skew_val > 0.5 && skew_val <= 1) {
+      suggestion <- "Square Root Transformation"
+    } else if (skew_val < -1) {
+      suggestion <- "Inverse Transformation"
+    } else if (skew_val < -0.5 && skew_val >= -1) {
+      suggestion <- "Square Transformation"
+    } else {
+      suggestion <- "None"
+    }
+    
+    skewness_table <- rbind(
+      skewness_table,
+      data.frame(
+        Variable = var,
+        Skewness = round(skew_val, 3),
+        Suggested_Transformation = suggestion,
+        stringsAsFactors = FALSE
+      )
+    )
+  } else {
+    warning(paste("Variable", var, "not found in the dataset."))
+  }
+}
+
+# 输出结果至文件
+write.csv(skewness_table, "skewness_table.csv", row.names = FALSE)
+
+# 在控制台查看结果
+print(skewness_table)
+
+```
+
+根据偏度表没有连续的 feature需要去transfer
+
+应用xgboost评估feature重要性
+
+```{r}
+# 加载数据
+data <- read.csv("raw2_train.csv")
+target_variable <- "Diagnosis"  # 修改为目标变量名称
+features <- setdiff(names(data), target_variable)
+
+# 数据准备
+X <- as.matrix(data[, features])
+y <- data[[target_variable]]
+
+# 训练 XGBoost 模型
+dtrain <- xgb.DMatrix(data = X, label = y)
+params <- list(objective = "binary:logistic", eval_metric = "auc")  # 示例为二分类任务
+xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 100)
+
+# 提取重要特征
+importance <- xgb.importance(feature_names = colnames(X), model = xgb_model)
+
+# 设置 Gain 的经验阈值
+gain_threshold <- 0.005  # 经验指标
+importance$Status <- ifelse(importance$Gain >= gain_threshold, "Keep", "Remove")
+
+# 划分保留和剔除的变量
+keep_features <- importance$Feature[importance$Status == "Keep"]
+remove_features <- importance$Feature[importance$Status == "Remove"]
+
+# 输出需要保留和删除的变量
+cat("Features to keep:\n", paste(keep_features, collapse = ", "), "\n\n")
+cat("Features to delete:\n", paste(remove_features, collapse = ", "), "\n\n")
+
+# 保存需要删除的变量到 CSV 文件
+write.csv(data.frame(Removed_Features = remove_features), 
+          "xgb_removed_features.csv", 
+          row.names = FALSE)
+
+# 绘制特征重要性图表
+ggplot(importance, aes(x = reorder(Feature, Gain), y = Gain, fill = Status)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  geom_hline(yintercept = gain_threshold, linetype = "dashed", color = "red", size = 1) +
+  scale_fill_manual(values = c("Keep" = "green", "Remove" = "red")) +
+  labs(title = "XGBoost Feature Importance",
+       x = "Features",
+       y = "Gain",
+       fill = "Status") +
+  theme_minimal()
+
+
+```
+
+创建剔除无关feature的function
+
+```{r}
+# 定义剔除变量的函数
+remove_features <- function(data_file, features_to_remove_file, output_file) {
+  # 加载数据
+  data <- read.csv(data_file, stringsAsFactors = FALSE)
+  features_to_remove <- read.csv(features_to_remove_file, stringsAsFactors = FALSE)
+  
+  # 提取需要剔除的特征列表
+  features_to_remove_list <- features_to_remove$Removed_Features
+  
+  # 检查哪些列需要删除
+  columns_to_remove <- intersect(names(data), features_to_remove_list)
+  
+  # 删除指定的列
+  data_cleaned <- data[, !(names(data) %in% columns_to_remove)]
+  
+  # 保存清理后的数据集
+  write.csv(data_cleaned, output_file, row.names = FALSE)
+  
+  return(data_cleaned)
+}
+```
+
+应用以上
+
+```{r}
+# 应用 remove_features 函数到训练集和测试集
+cleaned_train <- remove_features("raw2_train.csv", "xgb_removed_features.csv", "raw3_train.csv")
+cleaned_test <- remove_features("raw2_test.csv", "xgb_removed_features.csv", "raw3_test.csv")
+# 再次加载 raw3_train 以确保存在
+if (!exists("raw3_train")) {
+  raw3_train <- read.csv("raw3_train.csv")
+}
+# 移除 PatientID 列
+raw3_train$PatientID <- NULL
+write.csv(raw3_train, "raw3_train.csv", row.names = FALSE)
+```
+
+判断数据平衡以及平很数据
+
+```{r}
+
+library(ROSE)
+
+# 读取数据
+data <- read.csv("raw3_train.csv")
+
+# 定义目标变量
+target_variable <- "Diagnosis"
+
+# 检查数据类别分布
+cat("Class distribution before balancing:\n")
+print(table(data[[target_variable]]))
+
+# 使用 ROSE 生成平衡数据
+balanced_data <- ROSE(as.formula(paste(target_variable, "~ .")), data = data, seed = 42)$data
+
+# 检查平衡后的类别分布
+cat("Class distribution after balancing:\n")
+print(table(balanced_data[[target_variable]]))
+
+# 保存平衡后的数据集
+write.csv(balanced_data, "balanced_raw3_train.csv", row.names = FALSE)
+
+cat("Balanced dataset saved as 'balanced_raw3_train.csv'\n")
+
+
+```
+
+使用网格化优化参数
+
+```{r}
+# 读取数据
+data <- read.csv("raw3_train.csv")
+data$Diagnosis <- as.factor(data$Diagnosis)
+y <- data$Diagnosis
+X <- data[, setdiff(names(data), "Diagnosis")]
+
+# 分割数据集（分层抽样）
+set.seed(123)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+train_data <- X[train_index, ]
+train_label <- as.numeric(y[train_index]) - 1  # 转换为 0/1
+test_data <- X[-train_index, ]
+test_label <- as.numeric(y[-train_index]) - 1
+
+# 转换为 DMatrix 格式
+dtrain <- xgb.DMatrix(data = as.matrix(train_data), label = train_label)
+dtest <- xgb.DMatrix(data = as.matrix(test_data), label = test_label)
+
+# 定义参数网格为列表
+param_grid <- expand.grid(
+  max_depth = c(3, 6, 9),
+  eta = c(0.01, 0.1, 0.3),
+  subsample = c(0.6, 0.8, 1),
+  colsample_bytree = c(0.6, 0.8, 1),
+  min_child_weight = c(1, 5, 10),
+  gamma = c(0, 1, 5)
+)
+
+# 转换参数网格为列表格式
+param_list <- split(param_grid, seq(nrow(param_grid)))
+
+# 自定义评估函数
+custom_eval <- function(params) {
+  set.seed(123)  # 保持随机性一致
+  model <- xgb.train(
+    params = list(
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      max_depth = params$max_depth,
+      eta = params$eta,
+      subsample = params$subsample,
+      colsample_bytree = params$colsample_bytree,
+      min_child_weight = params$min_child_weight,
+      gamma = params$gamma,
+      tree_method = "hist"  # 使用直方图算法
+    ),
+    data = dtrain,
+    nrounds = 100,
+    watchlist = list(test = dtest),
+    early_stopping_rounds = 10,
+    verbose = 0
+  )
+  # 返回验证集 Logloss
+  return(model$best_score)
+}
+
+# 对每组参数进行评估
+results <- sapply(param_list, custom_eval)
+
+# 获取最优参数
+best_index <- which.min(results)
+best_params <- param_list[[best_index]]
+
+# 输出最优参数和对应的评估结果
+print(best_params)
+print(paste("最佳 Logloss:", round(min(results), 4)))
+
+
+# 保存最佳参数到 CSV 文件
+write.csv(best_params, "best_params.csv", row.names = FALSE)
+cat("Best parameters saved to 'best_params.csv'\n")
+
+
+
+```
+
+训练xgboost
+
+```{r}
+# 安装必要的包
+if (!requireNamespace("xgboost", quietly = TRUE)) install.packages("xgboost")
+if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+
+library(xgboost)
+library(caret)
+
+# 记录开始时间
+start_time <- Sys.time()
+
+# 读取数据
+data <- read.csv("raw3_train.csv")
+
+# 定义目标变量和特征变量
+target_variable <- "Diagnosis"
+features <- setdiff(names(data), target_variable)
+
+# 转换目标变量为因子
+data[[target_variable]] <- as.factor(data[[target_variable]])
+
+# 读取最佳参数
+best_params <- read.csv("best_params.csv")
+print("Best XGBoost Parameters:")
+print(best_params)
+
+# 设置 XGBoost 参数
+xgb_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "error",
+  max_depth = best_params$max_depth,
+  eta = best_params$eta,
+  gamma = best_params$gamma,
+  colsample_bytree = best_params$colsample_bytree,
+  min_child_weight = best_params$min_child_weight,
+  subsample = best_params$subsample
+)
+
+# 添加默认的 nrounds
+nrounds <- 100  # 默认值
+if ("nrounds" %in% colnames(best_params)) {
+  nrounds <- best_params$nrounds
+}
+
+# 定义 K-Fold 交叉验证
+set.seed(42)
+k <- 5  # 设置 K 值
+folds <- createFolds(data[[target_variable]], k = k, list = TRUE)
+
+# 初始化存储变量
+accuracies <- c()
+conf_matrices <- list()
+final_model <- NULL
+
+# K-Fold 交叉验证
+for (i in seq_along(folds)) {
+  cat("Fold", i, "in progress...\n")
+  
+  # 分割训练集和验证集
+  train_indices <- unlist(folds[-i])
+  test_indices <- unlist(folds[i])
+  
+  train_data <- data[train_indices, ]
+  test_data <- data[test_indices, ]
+  
+  # 准备训练数据
+  dtrain <- xgb.DMatrix(data = as.matrix(train_data[, features]), label = as.numeric(train_data[[target_variable]]) - 1)
+  dtest <- xgb.DMatrix(data = as.matrix(test_data[, features]), label = as.numeric(test_data[[target_variable]]) - 1)
+  
+  # 训练 XGBoost 模型
+  model <- xgb.train(params = xgb_params, data = dtrain, nrounds = nrounds)
+  
+  # 预测验证集
+  predictions <- predict(model, dtest)
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  
+  # 计算准确率
+  actual_classes <- as.numeric(test_data[[target_variable]]) - 1
+  accuracy <- mean(predicted_classes == actual_classes)
+  accuracies <- c(accuracies, accuracy)
+  
+  # 生成混淆矩阵
+  conf_matrix <- table(Predicted = predicted_classes, Actual = actual_classes)
+  conf_matrices[[i]] <- conf_matrix
+  
+  # 保存最后一轮模型
+  final_model <- model
+}
+
+# 输出交叉验证结果
+cat("Cross-Validation Accuracies:\n")
+print(accuracies)
+cat("Mean Accuracy:", mean(accuracies), "\n")
+
+# 保存最终模型
+saveRDS(final_model, file = "xgboost_model.rds")
+cat("Final model saved as 'xgboost_model.rds'\n")
+
+# 输出运行时间
+end_time <- Sys.time()
+run_time <- end_time - start_time
+cat("Total run time:", run_time, "\n")
+
+# 打印最后一个混淆矩阵
+cat("Confusion Matrix for Last Fold:\n")
+print(conf_matrices[[k]])
+
+```
+
+LOOCV 更低 理论准确度高实际很低
+
+```{r}
+# 加载必要的包
+if (!requireNamespace("xgboost", quietly = TRUE)) install.packages("xgboost")
+if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+
+library(xgboost)
+library(caret)
+
+# 读取数据
+data <- read.csv("balanced_raw3_train.csv")
+
+# 定义目标变量和特征变量
+target_variable <- "Diagnosis"
+features <- setdiff(names(data), target_variable)
+
+# 转换目标变量为因子
+data[[target_variable]] <- as.factor(data[[target_variable]])
+
+# 读取最佳参数
+best_params <- read.csv("best_params.csv")
+print("Best XGBoost Parameters:")
+print(best_params)
+
+# 添加默认的 nrounds（如未指定）
+nrounds <- 100  # 默认值
+if ("nrounds" %in% colnames(best_params)) {
+  nrounds <- best_params$nrounds
+}
+
+# 设置 XGBoost 参数
+xgb_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "error",
+  max_depth = best_params$max_depth,
+  eta = best_params$eta,
+  gamma = best_params$gamma,
+  colsample_bytree = best_params$colsample_bytree,
+  min_child_weight = best_params$min_child_weight,
+  subsample = best_params$subsample
+)
+
+# 初始化存储变量
+actual <- c()
+predicted <- c()
+
+# 初始化空列表存储每轮模型
+xgb_models <- list()
+
+# 留一法交叉验证 (LOOCV)
+set.seed(42)
+for (i in 1:nrow(data)) {
+  # 分割训练集和测试集
+  train_data <- data[-i, ]
+  test_data <- data[i, , drop = FALSE]
+  
+  # 准备训练数据
+  dtrain <- xgb.DMatrix(data = as.matrix(train_data[, features]), label = as.numeric(train_data[[target_variable]]) - 1)
+  dtest <- xgb.DMatrix(data = as.matrix(test_data[, features]))
+  
+  # 训练 XGBoost 模型
+  xgb_model <- xgb.train(params = xgb_params, data = dtrain, nrounds = nrounds)
+  
+  # 保存模型到列表
+  xgb_models[[i]] <- xgb_model
+  
+  # 预测
+  pred_xgb <- predict(xgb_model, dtest)
+  
+  # 转换预测为分类结果
+  final_pred <- ifelse(pred_xgb > 0.5, 1, 0)
+  
+  # 存储预测值和实际值
+  predicted <- c(predicted, final_pred)
+  actual <- c(actual, as.numeric(test_data[[target_variable]]) - 1)
+}
+
+# 计算准确率
+accuracy <- mean(predicted == actual)
+cat("Accuracy:", accuracy, "\n")
+
+# 混淆矩阵
+conf_matrix <- table(Predicted = predicted, Actual = actual)
+print("Confusion Matrix:")
+print(conf_matrix)
+
+# 保存最终模型为 RDS 格式
+saveRDS(xgb_models, "xgb_loocv_models.rds")
+cat("XGBoost models saved to 'xgb_loocv_models.rds'\n")
+
+```
+
+```{r}
+# 加载必要的库
+library(xgboost)
+library(readr)
+library(dplyr)
+
+# 设置文件路径
+model_path <- "xgboost_model.rds"
+test_data_path <- "raw3_test.csv"  # 确认文件名正确
+output_path <- "predictions12.5.8.csv"
+
+# 读取已训练的 XGBoost 模型
+model <- readRDS(model_path)
+
+# 读取测试数据
+test_data <- read.csv(test_data_path, stringsAsFactors = FALSE)
+
+# 检查测试数据的列名
+cat("测试数据的列名:\n")
+print(colnames(test_data))
+
+# 确认 PatientID 列存在
+if(!"PatientID" %in% colnames(test_data)){
+  stop("测试数据中不存在 PatientID 列，请检查列名是否正确。")
+}
+
+# 提取 PatientID
+patient_ids <- test_data$PatientID
+
+# 移除 PatientID 列
+# 使用基础 R 移除 PatientID 列
+features <- test_data[, !(names(test_data) %in% c("PatientID"))]
+
+# 检查模型是单个模型还是多个模型（例如 LOOCV 生成的模型列表）
+if(class(model) == "xgb.Booster"){
+  
+  # 单个模型的处理
+  # 提取模型的特征名
+  model_features <- model$feature_names
+  cat("模型的特征名:\n")
+  print(model_features)
+  
+  # 检查测试数据中是否包含所有模型特征
+  missing_features <- setdiff(model_features, colnames(features))
+  if(length(missing_features) > 0){
+    warning("测试数据缺少以下模型特征，将这些特征设置为0: ", paste(missing_features, collapse = ", "))
+    # 添加缺失的特征，赋值为0
+    for(feature in missing_features){
+      features[[feature]] <- 0
+    }
+  }
+  
+  # 检查测试数据中是否有额外的特征
+  extra_features <- setdiff(colnames(features), model_features)
+  if(length(extra_features) > 0){
+    warning("测试数据中存在以下模型未使用的特征，将被移除: ", paste(extra_features, collapse = ", "))
+    # 移除额外的特征
+    features <- features[, !(names(features) %in% extra_features)]
+  }
+  
+  # 确保特征的顺序与模型一致
+  features <- features[, model_features]
+  
+  # 确认对齐后的特征名
+  cat("对齐后的特征名:\n")
+  print(colnames(features))
+  
+  # 将特征转换为矩阵格式
+  feature_matrix <- as.matrix(features)
+  
+  # 进行预测
+  pred_prob <- predict(model, feature_matrix)
+  
+  # 转换为类别标签（0 否，1 是，阈值为0.5）
+  pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+  
+} else if (is.list(model)) {
+  
+  # 多个模型的处理（例如 LOOCV 生成的多个模型）
+  
+  # 提取所有模型的特征名
+  model_features_list <- lapply(model, function(m) m$feature_names)
+  
+  # 检查所有模型是否使用相同的特征名
+  unique_features <- unique(sapply(model_features_list, function(x) paste(x, collapse = ",")))
+  if(length(unique_features) != 1){
+    stop("不同模型使用的特征名不一致，无法进行集成预测。")
+  }
+  
+  # 假设所有模型使用相同的特征名
+  model_features <- model_features_list[[1]]
+  cat("模型的特征名:\n")
+  print(model_features)
+  
+  # 检查测试数据中是否包含所有模型特征
+  missing_features <- setdiff(model_features, colnames(features))
+  if(length(missing_features) > 0){
+    warning("测试数据缺少以下模型特征，将这些特征设置为0: ", paste(missing_features, collapse = ", "))
+    # 添加缺失的特征，赋值为0
+    for(feature in missing_features){
+      features[[feature]] <- 0
+    }
+  }
+  
+  # 检查测试数据中是否有额外的特征
+  extra_features <- setdiff(colnames(features), model_features)
+  if(length(extra_features) > 0){
+    warning("测试数据中存在以下模型未使用的特征，将被移除: ", paste(extra_features, collapse = ", "))
+    # 移除额外的特征
+    features <- features[, !(names(features) %in% extra_features)]
+  }
+  
+  # 确保特征的顺序与模型一致
+  features <- features[, model_features]
+  
+  # 确认对齐后的特征名
+  cat("对齐后的特征名:\n")
+  print(colnames(features))
+  
+  # 将特征转换为矩阵格式
+  feature_matrix <- as.matrix(features)
+  
+  # 对每个模型进行预测，保存所有预测结果
+  predictions_list <- lapply(model, function(m) {
+    predict(m, feature_matrix)
+  })
+  
+  # 将所有预测结果转换为矩阵
+  pred_matrix <- do.call(cbind, predictions_list)
+  
+  # 对所有模型的预测结果取平均
+  avg_pred_prob <- rowMeans(pred_matrix)
+  
+  # 转换为类别标签（0 否，1 是，阈值为0.5）
+  pred_class <- ifelse(avg_pred_prob > 0.5, 1, 0)
+  
+} else {
+  stop("模型的类型未知，请检查模型文件。")
+}
+
+# 创建输出数据框
+output <- data.frame(
+  PatientID = patient_ids,
+  Diagnosis = pred_class,
+  stringsAsFactors = FALSE
+)
+
+# 查看输出数据框
+cat("输出数据预览:\n")
+print(head(output))
+
+# 将结果写入 CSV 文件
+write.csv(output, output_path, row.names = FALSE)
+
+# 输出完成提示
+cat("预测结果已保存到", output_path, "\n")
+
+```
